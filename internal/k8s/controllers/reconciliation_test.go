@@ -4,6 +4,8 @@ package controllers
 
 import (
 	"context"
+	"fmt"
+	"net"
 	"path/filepath"
 	"sync"
 	"sync/atomic"
@@ -14,22 +16,26 @@ import (
 	frrv1beta1 "github.com/metallb/frr-k8s/api/v1beta1"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
-	v1beta1 "go.universe.tf/metallb/api/v1beta1"
-	v1beta2 "go.universe.tf/metallb/api/v1beta2"
-	frrk8s "go.universe.tf/metallb/internal/bgp/frrk8s"
-	"go.universe.tf/metallb/internal/config"
 	corev1 "k8s.io/api/core/v1"
 	discovery "k8s.io/api/discovery/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/rest"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/envtest"
+	"sigs.k8s.io/controller-runtime/pkg/event"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
+
+	v1beta1 "go.universe.tf/metallb/api/v1beta1"
+	v1beta2 "go.universe.tf/metallb/api/v1beta2"
+	frrk8s "go.universe.tf/metallb/internal/bgp/frrk8s"
+	"go.universe.tf/metallb/internal/config"
+	"go.universe.tf/metallb/internal/layer2"
 )
 
 /*
@@ -52,11 +58,23 @@ var (
 	nodeMutex        sync.Mutex
 	nodeConfigUpdate int
 
-	frrk8sReconciler *FRRK8sReconciler
+	frrk8sReconciler       *FRRK8sReconciler
+	layer2StatusReconciler *Layer2StatusReconciler
+	layer2StatusUpdateChan = make(chan event.GenericEvent)
+	layer2ServiceAdvs      []layer2.IPAdvertisement
+	layer2ServiceAdvLock   sync.Mutex
+	updateLayer2Advs       = func(advs []layer2.IPAdvertisement) {
+		layer2ServiceAdvLock.Lock()
+		defer layer2ServiceAdvLock.Unlock()
+		layer2ServiceAdvs = advs
+	}
+	speakerPod *corev1.Pod
 )
 
 const (
-	testNodeName = "testnode"
+	testNodeName     = "testnode"
+	testServiceName  = "test-service"
+	speakerNamespace = "metallb-system"
 )
 
 func TestManager(t *testing.T) {
@@ -106,6 +124,35 @@ var _ = BeforeSuite(func() {
 	})
 	Expect(err).ToNot(HaveOccurred())
 
+	ctx, cancel = context.WithCancel(context.TODO())
+	// test service is located in testNamespace
+	// speaker pod is deployed in speakerNamespace
+	// the layer2 status crs are maintained in speakerNamespace
+	err = func(namespaces []string) error {
+		for _, namespace := range namespaces {
+			namespaceObj := &corev1.Namespace{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: namespace,
+				},
+			}
+			err := k8sClient.Create(ctx, namespaceObj)
+			if err != nil {
+				return err
+			}
+		}
+		return nil
+	}([]string{testNamespace, speakerNamespace})
+	Expect(err).ToNot(HaveOccurred())
+
+	speakerPod = &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "speaker", Namespace: speakerNamespace},
+		Spec: corev1.PodSpec{Containers: []corev1.Container{
+			{Name: "speaker", Image: "speaker"},
+		}},
+	}
+	err = k8sClient.Create(ctx, speakerPod)
+	Expect(err).ToNot(HaveOccurred())
+
 	mockHandler := func(l log.Logger, n *corev1.Node) SyncState {
 		nodeMutex.Lock()
 		defer nodeMutex.Unlock()
@@ -138,16 +185,35 @@ var _ = BeforeSuite(func() {
 	Expect(err).ToNot(HaveOccurred())
 
 	frrk8sReconciler = &FRRK8sReconciler{
-		Client:    k8sManager.GetClient(),
-		Scheme:    k8sManager.GetScheme(),
-		Logger:    log.NewNopLogger(),
-		NodeName:  testNodeName,
-		Namespace: testNamespace,
+		Client:          k8sManager.GetClient(),
+		Scheme:          k8sManager.GetScheme(),
+		Logger:          log.NewNopLogger(),
+		NodeName:        testNodeName,
+		FRRK8sNamespace: testNamespace,
 	}
 	err = frrk8sReconciler.SetupWithManager(k8sManager)
 	Expect(err).ToNot(HaveOccurred())
 
-	ctx, cancel = context.WithCancel(context.TODO())
+	layer2StatusReconciler = &Layer2StatusReconciler{
+		Client:        k8sManager.GetClient(),
+		Logger:        log.NewNopLogger(),
+		NodeName:      testNodeName,
+		Namespace:     speakerNamespace,
+		SpeakerPod:    speakerPod,
+		ReconcileChan: layer2StatusUpdateChan,
+		StatusFetcher: func(nn types.NamespacedName) []layer2.IPAdvertisement {
+			layer2ServiceAdvLock.Lock()
+			defer layer2ServiceAdvLock.Unlock()
+			// only advertise for the test service to prevent
+			// controller from reconcile infinitely
+			if nn.Name == testServiceName {
+				return layer2ServiceAdvs
+			}
+			return []layer2.IPAdvertisement{}
+		},
+	}
+	err = layer2StatusReconciler.SetupWithManager(k8sManager)
+	Expect(err).ToNot(HaveOccurred())
 
 	go func() {
 		defer func() { mgrDone.Store(true) }()
@@ -164,14 +230,6 @@ var _ = BeforeSuite(func() {
 	}
 	err = k8sClient.Create(ctx, node)
 	Expect(err).ToNot(HaveOccurred())
-
-	namespace := &corev1.Namespace{
-		ObjectMeta: metav1.ObjectMeta{
-			Name: testNamespace,
-		},
-	}
-	err = k8sClient.Create(ctx, namespace)
-	Expect(err).ToNot(HaveOccurred())
 })
 
 var _ = AfterSuite(func() {
@@ -179,7 +237,7 @@ var _ = AfterSuite(func() {
 	cancel()
 	err := testEnv.Stop()
 	Expect(err).NotTo(HaveOccurred())
-	Eventually(mgrDone.Load(), 5*time.Second, 200*time.Millisecond).Should(BeTrue())
+	Eventually(mgrDone.Load, 5*time.Second, 200*time.Millisecond).Should(BeTrue())
 	requestHandler = configRequestHandler
 })
 
@@ -423,6 +481,91 @@ var _ = Describe("FRRK8S Controller", func() {
 				}
 				return toCheck.Generation
 			}, 5*time.Second, 200*time.Millisecond).Should(Equal(storedConfig.Generation))
+		})
+	})
+})
+
+var _ = Describe("Layer2 Status Controller", func() {
+	Context("SetupWithManager", func() {
+		It("Should Reconcile correctly", func() {
+			statusObjFetcherFunc := func() ([]v1beta1.ServiceL2Status, error) {
+				statusList := v1beta1.ServiceL2StatusList{}
+				err := k8sClient.List(context.TODO(), &statusList,
+					client.MatchingLabels{
+						LabelServiceName:      testServiceName,
+						LabelServiceNamespace: testNamespace,
+						LabelAnnounceNode:     testNodeName,
+					},
+				)
+				if err != nil {
+					return nil, err
+				}
+				return statusList.Items, nil
+			}
+
+			statusResultCheckFunc := func(statuses []v1beta1.ServiceL2Status) error {
+				if len(statuses) != 1 {
+					return fmt.Errorf("expect 1 status object, but got %d", len(statuses))
+				}
+				if len(statuses[0].OwnerReferences) != 1 {
+					return fmt.Errorf("expect 1 owner reference, but got %d", len(statuses[0].OwnerReferences))
+				}
+				ownRef := statuses[0].OwnerReferences[0]
+				if ownRef.UID != speakerPod.UID {
+					return fmt.Errorf("owner reference is not speaker pod, expect owner reference uid %s, but got %s", speakerPod.UID, ownRef.UID)
+				}
+				return nil
+			}
+
+			// simulate some service is advertised
+			layer2ServiceAdvs = append(layer2ServiceAdvs,
+				layer2.NewIPAdvertisement(net.IP("127.0.0.1"), true, sets.Set[string]{}))
+			// notify reconciler to reconcile
+			layer2StatusUpdateChan <- NewL2StatusEvent(testNamespace, testServiceName)
+			Eventually(func() string {
+				statuses, err := statusObjFetcherFunc()
+				if err != nil {
+					return err.Error()
+				}
+				err = statusResultCheckFunc(statuses)
+				if err != nil {
+					return err.Error()
+				}
+				return statuses[0].Status.Node
+			}, 5*time.Second, 200*time.Millisecond).Should(Equal(testNodeName))
+
+			// simulate the service advertisement interface changed
+			interfaces := sets.Set[string]{}
+			newInterface := "eth0"
+			interfaces.Insert(newInterface)
+			updateLayer2Advs([]layer2.IPAdvertisement{layer2.NewIPAdvertisement(net.IP("127.0.0.1"), false, interfaces)})
+			layer2StatusUpdateChan <- NewL2StatusEvent(testNamespace, testServiceName)
+			Eventually(func() string {
+				statuses, err := statusObjFetcherFunc()
+				if err != nil {
+					return err.Error()
+				}
+				err = statusResultCheckFunc(statuses)
+				if err != nil {
+					return err.Error()
+				}
+				if len(statuses[0].Status.Interfaces) == 0 {
+					return fmt.Errorf("status object has no interfaces").Error()
+				}
+				return statuses[0].Status.Interfaces[0].Name
+			}, 5*time.Second, 200*time.Millisecond).Should(Equal(newInterface))
+
+			// simulate the service is not advertised anymore
+			updateLayer2Advs([]layer2.IPAdvertisement{})
+			// notify the reconciler again
+			layer2StatusUpdateChan <- NewL2StatusEvent(testNamespace, testServiceName)
+			Eventually(func() bool {
+				statuses, err := statusObjFetcherFunc()
+				if err != nil {
+					return false
+				}
+				return len(statuses) == 0
+			}, 5*time.Second, 200*time.Millisecond).Should(BeTrue())
 		})
 	})
 })

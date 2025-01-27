@@ -49,11 +49,11 @@ type BFDProfileValidator struct {
 	ClusterResourceNamespace string
 
 	client  client.Client
-	decoder *admission.Decoder
+	decoder admission.Decoder
 }
 
 // Handle handled incoming admission requests for BFDProfile objects.
-func (v *BFDProfileValidator) Handle(ctx context.Context, req admission.Request) (resp admission.Response) {
+func (v *BFDProfileValidator) Handle(ctx context.Context, req admission.Request) admission.Response {
 	var bfdProfile v1beta1.BFDProfile
 	var oldBFDProfile v1beta1.BFDProfile
 	if req.Operation == v1.Delete {
