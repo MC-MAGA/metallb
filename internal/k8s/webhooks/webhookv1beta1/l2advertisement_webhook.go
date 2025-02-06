@@ -21,8 +21,9 @@ import (
 	"fmt"
 	"net/http"
 
+	"errors"
+
 	"github.com/go-kit/log/level"
-	"github.com/pkg/errors"
 	"go.universe.tf/metallb/api/v1beta1"
 	v1 "k8s.io/api/admission/v1"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -49,11 +50,11 @@ type L2AdvertisementValidator struct {
 	ClusterResourceNamespace string
 
 	client  client.Client
-	decoder *admission.Decoder
+	decoder admission.Decoder
 }
 
 // Handle handled incoming admission requests for L2Advertisement objects.
-func (v *L2AdvertisementValidator) Handle(ctx context.Context, req admission.Request) (resp admission.Response) {
+func (v *L2AdvertisementValidator) Handle(ctx context.Context, req admission.Request) admission.Response {
 	var advertisement v1beta1.L2Advertisement
 	var oldAdvertisement v1beta1.L2Advertisement
 	if req.Operation == v1.Delete {
@@ -104,18 +105,13 @@ func validateL2AdvCreate(l2Adv *v1beta1.L2Advertisement) error {
 		return err
 	}
 
-	addressPools, err := getExistingAddressPools()
-	if err != nil {
-		return err
-	}
-
 	ipAddressPools, err := getExistingIPAddressPools()
 	if err != nil {
 		return err
 	}
 
 	toValidate := l2AdvListWithUpdate(existingL2AdvList, l2Adv)
-	err = Validator.Validate(toValidate, addressPools, ipAddressPools)
+	err = Validator.Validate(toValidate, ipAddressPools)
 	if err != nil {
 		level.Error(Logger).Log("webhook", "v1beta1.L2Advertisement", "action", "create", "name", l2Adv.Name, "namespace", l2Adv.Namespace, "error", err)
 		return err
@@ -123,16 +119,11 @@ func validateL2AdvCreate(l2Adv *v1beta1.L2Advertisement) error {
 	return nil
 }
 
-// validateL2Update implements webhook.Validator so a webhook will be registered for v1beta1.L2Advertisement.
+// validateL2AdvUpdate implements webhook.Validator so a webhook will be registered for v1beta1.L2Advertisement.
 func validateL2AdvUpdate(l2Adv *v1beta1.L2Advertisement, _ *v1beta1.L2Advertisement) error {
 	level.Debug(Logger).Log("webhook", "v1beta1.L2Advertisement", "action", "update", "name", l2Adv.Name, "namespace", l2Adv.Namespace)
 
 	l2Advs, err := getExistingL2Advs()
-	if err != nil {
-		return err
-	}
-
-	addressPools, err := getExistingAddressPools()
 	if err != nil {
 		return err
 	}
@@ -143,7 +134,7 @@ func validateL2AdvUpdate(l2Adv *v1beta1.L2Advertisement, _ *v1beta1.L2Advertisem
 	}
 
 	toValidate := l2AdvListWithUpdate(l2Advs, l2Adv)
-	err = Validator.Validate(toValidate, addressPools, ipAddressPools)
+	err = Validator.Validate(toValidate, ipAddressPools)
 	if err != nil {
 		level.Error(Logger).Log("webhook", "v1beta1.L2Advertisement", "action", "create", "name", l2Adv.Name, "namespace", l2Adv.Namespace, "error", err)
 		return err
@@ -160,7 +151,7 @@ var getExistingL2Advs = func() (*v1beta1.L2AdvertisementList, error) {
 	existingL2AdvList := &v1beta1.L2AdvertisementList{}
 	err := WebhookClient.List(context.Background(), existingL2AdvList, &client.ListOptions{Namespace: MetalLBNamespace})
 	if err != nil {
-		return nil, errors.Wrapf(err, "Failed to get existing v1beta1.L2Advertisement objects")
+		return nil, errors.Join(err, errors.New("failed to get existing v1beta1.L2Advertisement objects"))
 	}
 	return existingL2AdvList, nil
 }

@@ -16,7 +16,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 )
 
-func InitReporter(kubeconfig, path, namespace string) *k8sreporter.KubernetesReporter {
+func InitReporter(kubeconfig, path string, namespaces ...string) *k8sreporter.KubernetesReporter {
 	// When using custom crds, we need to add them to the scheme
 	addToScheme := func(s *runtime.Scheme) error {
 		err := metallbv1beta1.AddToScheme(s)
@@ -37,9 +37,13 @@ func InitReporter(kubeconfig, path, namespace string) *k8sreporter.KubernetesRep
 
 	// The namespaces we want to dump resources for (including pods and pod logs)
 	dumpNamespace := func(ns string) bool {
+		for _, n := range namespaces {
+			if n == ns {
+				return true
+			}
+		}
+
 		switch {
-		case ns == namespace:
-			return true
 		case strings.HasPrefix(ns, "l2"):
 			return true
 		case strings.HasPrefix(ns, "bgp"):
@@ -51,7 +55,6 @@ func InitReporter(kubeconfig, path, namespace string) *k8sreporter.KubernetesRep
 	// The list of CRDs we want to dump
 	crds := []k8sreporter.CRData{
 		{Cr: &metallbv1beta1.IPAddressPoolList{}},
-		{Cr: &metallbv1beta1.AddressPoolList{}},
 		{Cr: &metallbv1beta2.BGPPeerList{}},
 		{Cr: &metallbv1beta1.L2AdvertisementList{}},
 		{Cr: &metallbv1beta1.BGPAdvertisementList{}},

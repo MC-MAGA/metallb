@@ -21,8 +21,9 @@ import (
 	"fmt"
 	"net/http"
 
+	"errors"
+
 	"github.com/go-kit/log/level"
-	"github.com/pkg/errors"
 	"go.universe.tf/metallb/api/v1beta1"
 	v1 "k8s.io/api/admission/v1"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -49,11 +50,11 @@ type IPAddressPoolValidator struct {
 	ClusterResourceNamespace string
 
 	client  client.Client
-	decoder *admission.Decoder
+	decoder admission.Decoder
 }
 
 // Handle handled incoming admission requests for IPAddressPool objects.
-func (v *IPAddressPoolValidator) Handle(ctx context.Context, req admission.Request) (resp admission.Response) {
+func (v *IPAddressPoolValidator) Handle(ctx context.Context, req admission.Request) admission.Response {
 	var pool v1beta1.IPAddressPool
 	var oldPool v1beta1.IPAddressPool
 	if req.Operation == v1.Delete {
@@ -103,12 +104,8 @@ func validateIPAddressPoolCreate(ipAddress *v1beta1.IPAddressPool) error {
 		return err
 	}
 
-	existingAddressPoolList, err := getExistingAddressPools()
-	if err != nil {
-		return err
-	}
 	toValidate := ipAddressListWithUpdate(existingIPAddressPoolList, ipAddress)
-	err = Validator.Validate(existingAddressPoolList, toValidate)
+	err = Validator.Validate(toValidate)
 	if err != nil {
 		level.Error(Logger).Log("webhook", "ipAddress", "action", "create", "name", ipAddress.Name, "namespace", ipAddress.Namespace, "error", err)
 		return err
@@ -119,10 +116,6 @@ func validateIPAddressPoolCreate(ipAddress *v1beta1.IPAddressPool) error {
 // validateIPAddressPoolUpdate implements webhook.Validator so a webhook will be registered for IPAddressPool.
 func validateIPAddressPoolUpdate(ipAddress *v1beta1.IPAddressPool, _ *v1beta1.IPAddressPool) error {
 	level.Debug(Logger).Log("webhook", "ipaddresspool", "action", "update", "name", ipAddress.Name, "namespace", ipAddress.Namespace)
-	existingAddressPoolList, err := getExistingAddressPools()
-	if err != nil {
-		return err
-	}
 
 	existingIPAddressPoolList, err := getExistingIPAddressPools()
 	if err != nil {
@@ -130,7 +123,7 @@ func validateIPAddressPoolUpdate(ipAddress *v1beta1.IPAddressPool, _ *v1beta1.IP
 	}
 
 	toValidate := ipAddressListWithUpdate(existingIPAddressPoolList, ipAddress)
-	err = Validator.Validate(existingAddressPoolList, toValidate)
+	err = Validator.Validate(toValidate)
 	if err != nil {
 		level.Error(Logger).Log("webhook", "ipAddress", "action", "update", "name", ipAddress.Name, "namespace", ipAddress.Namespace, "error", err)
 		return err
@@ -147,7 +140,7 @@ var getExistingIPAddressPools = func() (*v1beta1.IPAddressPoolList, error) {
 	existingIPAddressPoolList := &v1beta1.IPAddressPoolList{}
 	err := WebhookClient.List(context.Background(), existingIPAddressPoolList, &client.ListOptions{Namespace: MetalLBNamespace})
 	if err != nil {
-		return nil, errors.Wrapf(err, "Failed to get existing IPAddressPool objects")
+		return nil, errors.Join(err, errors.New("failed to get existing IPAddressPool objects"))
 	}
 	return existingIPAddressPoolList, nil
 }

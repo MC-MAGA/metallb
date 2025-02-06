@@ -227,7 +227,7 @@ func (sm *sessionManager) updateConfig() error {
 			routers[routerName] = rout
 		}
 
-		neighborName := frr.NeighborName(s.PeerAddress, s.PeerASN, s.VRFName)
+		neighborName := frr.NeighborName(s.PeerAddress, s.PeerASN, s.DynamicASN, s.VRFName)
 		if neighbor, exist = rout.neighbors[neighborName]; !exist {
 			host, port, err := net.SplitHostPort(s.PeerAddress)
 			if err != nil {
@@ -240,19 +240,35 @@ func (sm *sessionManager) updateConfig() error {
 			}
 			portUint16 := uint16(portUint)
 
-			password := ""
-			if reflect.DeepEqual(s.PasswordRef, corev1.SecretReference{}) {
-				password = s.Password
+			if !reflect.DeepEqual(s.PasswordRef, corev1.SecretReference{}) && s.Password != "" {
+				return fmt.Errorf("invalid session with password and secret set: %s", sessionName(*s))
+			}
+
+			var connectTime *metav1.Duration
+			if s.ConnectTime != nil {
+				connectTime = &metav1.Duration{Duration: *s.ConnectTime}
+			}
+
+			var holdTime *metav1.Duration
+			var keepaliveTime *metav1.Duration
+			if s.HoldTime != nil {
+				holdTime = &metav1.Duration{Duration: *s.HoldTime}
+			}
+			if s.KeepAliveTime != nil {
+				keepaliveTime = &metav1.Duration{Duration: *s.KeepAliveTime}
 			}
 
 			neighbor = frrv1beta1.Neighbor{
-				ASN:           s.PeerASN,
-				Address:       host,
-				Port:          &portUint16,
-				HoldTime:      &metav1.Duration{Duration: s.HoldTime},
-				KeepaliveTime: &metav1.Duration{Duration: s.KeepAliveTime},
-				BFDProfile:    s.BFDProfile,
-				EBGPMultiHop:  s.EBGPMultiHop,
+				ASN:                   s.PeerASN,
+				DynamicASN:            frrv1beta1.DynamicASNMode(s.DynamicASN),
+				Address:               host,
+				Port:                  &portUint16,
+				HoldTime:              holdTime,
+				KeepaliveTime:         keepaliveTime,
+				ConnectTime:           connectTime,
+				BFDProfile:            s.BFDProfile,
+				EnableGracefulRestart: s.GracefulRestart,
+				EBGPMultiHop:          s.EBGPMultiHop,
 				ToAdvertise: frrv1beta1.Advertise{
 					Allowed: frrv1beta1.AllowedOutPrefixes{
 						Prefixes: make([]string, 0),
@@ -260,8 +276,12 @@ func (sm *sessionManager) updateConfig() error {
 					PrefixesWithLocalPref: make([]frrv1beta1.LocalPrefPrefixes, 0),
 					PrefixesWithCommunity: make([]frrv1beta1.CommunityPrefixes, 0),
 				},
-				Password:       password,
-				PasswordSecret: s.PasswordRef,
+				Password: s.Password,
+				PasswordSecret: frrv1beta1.SecretReference{
+					Name:      s.PasswordRef.Name,
+					Namespace: s.PasswordRef.Namespace,
+				},
+				DisableMP: s.DisableMP,
 			}
 		}
 
@@ -271,10 +291,6 @@ func (sm *sessionManager) updateConfig() error {
 		prefixesForCommunity := map[string][]string{}
 		prefixesForLocalPref := map[uint32][]string{}
 		for _, adv := range s.advertised {
-			if !adv.MatchesPeer(s.SessionName) {
-				continue
-			}
-
 			prefix := adv.Prefix.String()
 			neighbor.ToAdvertise.Allowed.Prefixes = append(neighbor.ToAdvertise.Allowed.Prefixes, prefix)
 			rout.prefixes[prefix] = prefix
@@ -292,6 +308,7 @@ func (sm *sessionManager) updateConfig() error {
 		}
 		neighbor.ToAdvertise.PrefixesWithCommunity = toAdvertiseWithCommunity(prefixesForCommunity)
 		neighbor.ToAdvertise.PrefixesWithLocalPref = toAdvertiseWithLocalPref(prefixesForLocalPref)
+		neighbor.ToAdvertise.Allowed.Prefixes = removeDuplicates(neighbor.ToAdvertise.Allowed.Prefixes)
 		sort.Strings(neighbor.ToAdvertise.Allowed.Prefixes)
 
 		rout.neighbors[neighborName] = neighbor
@@ -347,7 +364,7 @@ func toAdvertiseWithCommunity(prefixesForCommunity map[string][]string) []frrv1b
 	res := []frrv1beta1.CommunityPrefixes{}
 	for c, prefixes := range prefixesForCommunity {
 		sort.Strings(prefixes)
-		res = append(res, frrv1beta1.CommunityPrefixes{Community: c, Prefixes: prefixes})
+		res = append(res, frrv1beta1.CommunityPrefixes{Community: c, Prefixes: removeDuplicates(prefixes)})
 	}
 	sort.Slice(res, func(i, j int) bool {
 		return res[i].Community < res[j].Community
@@ -355,11 +372,24 @@ func toAdvertiseWithCommunity(prefixesForCommunity map[string][]string) []frrv1b
 	return res
 }
 
+func removeDuplicates(input []string) []string {
+	seen := make(map[string]struct{})
+	result := []string{}
+
+	for _, value := range input {
+		if _, ok := seen[value]; !ok {
+			seen[value] = struct{}{}
+			result = append(result, value)
+		}
+	}
+	return result
+}
+
 func toAdvertiseWithLocalPref(prefixesForLocalPref map[uint32][]string) []frrv1beta1.LocalPrefPrefixes {
 	res := []frrv1beta1.LocalPrefPrefixes{}
 	for p, prefixes := range prefixesForLocalPref {
 		sort.Strings(prefixes)
-		res = append(res, frrv1beta1.LocalPrefPrefixes{LocalPref: p, Prefixes: prefixes})
+		res = append(res, frrv1beta1.LocalPrefPrefixes{LocalPref: p, Prefixes: removeDuplicates(prefixes)})
 	}
 	sort.Slice(res, func(i, j int) bool {
 		return res[i].LocalPref < res[j].LocalPref

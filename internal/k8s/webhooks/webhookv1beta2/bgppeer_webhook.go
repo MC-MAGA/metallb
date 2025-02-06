@@ -21,8 +21,9 @@ import (
 	"fmt"
 	"net/http"
 
+	"errors"
+
 	"github.com/go-kit/log/level"
-	"github.com/pkg/errors"
 	"go.universe.tf/metallb/api/v1beta2"
 	v1 "k8s.io/api/admission/v1"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -49,11 +50,11 @@ type BGPPeerValidator struct {
 	ClusterResourceNamespace string
 
 	client  client.Client
-	decoder *admission.Decoder
+	decoder admission.Decoder
 }
 
 // Handle handled incoming admission requests for BGPPeer objects.
-func (v *BGPPeerValidator) Handle(ctx context.Context, req admission.Request) (resp admission.Response) {
+func (v *BGPPeerValidator) Handle(ctx context.Context, req admission.Request) admission.Response {
 	var peer v1beta2.BGPPeer
 	var oldPeer v1beta2.BGPPeer
 	if req.Operation == v1.Delete {
@@ -111,7 +112,7 @@ func validatePeerCreate(bgpPeer *v1beta2.BGPPeer) error {
 	return nil
 }
 
-// validatePeerUpdate implements webhook.Validator so a webhook will be registered for AddressPool.
+// validatePeerUpdate implements webhook.Validator so a webhook will be registered for BGPPeer.
 func validatePeerUpdate(bgpPeer *v1beta2.BGPPeer, _ *v1beta2.BGPPeer) error {
 	level.Debug(Logger).Log("webhook", "bgppeer", "action", "update", "name", bgpPeer.Name, "namespace", bgpPeer.Namespace)
 
@@ -129,7 +130,7 @@ func validatePeerUpdate(bgpPeer *v1beta2.BGPPeer, _ *v1beta2.BGPPeer) error {
 	return nil
 }
 
-// validatePeerDelete implements webhook.Validator so a webhook will be registered for AddressPool.
+// validatePeerDelete implements webhook.Validator so a webhook will be registered for BGPPeer.
 func validatePeerDelete(bgpPeer *v1beta2.BGPPeer) error {
 	return nil
 }
@@ -138,7 +139,7 @@ var GetExistingBGPPeers = func() (*v1beta2.BGPPeerList, error) {
 	existingBGPPeerslList := &v1beta2.BGPPeerList{}
 	err := WebhookClient.List(context.Background(), existingBGPPeerslList, &client.ListOptions{Namespace: MetalLBNamespace})
 	if err != nil {
-		return nil, errors.Wrapf(err, "Failed to get existing BGPPeer objects")
+		return nil, errors.Join(err, errors.New("failed to get existing BGPPeer objects"))
 	}
 	return existingBGPPeerslList, nil
 }
