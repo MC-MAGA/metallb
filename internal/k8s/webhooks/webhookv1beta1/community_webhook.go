@@ -21,8 +21,9 @@ import (
 	"fmt"
 	"net/http"
 
+	"errors"
+
 	"github.com/go-kit/log/level"
-	"github.com/pkg/errors"
 	"go.universe.tf/metallb/api/v1beta1"
 	v1 "k8s.io/api/admission/v1"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -49,11 +50,11 @@ type CommunityValidator struct {
 	ClusterResourceNamespace string
 
 	client  client.Client
-	decoder *admission.Decoder
+	decoder admission.Decoder
 }
 
 // Handle handled incoming admission requests for Community objects.
-func (v *CommunityValidator) Handle(ctx context.Context, req admission.Request) (resp admission.Response) {
+func (v *CommunityValidator) Handle(ctx context.Context, req admission.Request) admission.Response {
 	var community v1beta1.Community
 	var oldCommunity v1beta1.Community
 	if req.Operation == v1.Delete {
@@ -82,7 +83,6 @@ func (v *CommunityValidator) Handle(ctx context.Context, req admission.Request) 
 		if err != nil {
 			return admission.Denied(err.Error())
 		}
-		return
 	case v1.Delete:
 		err := validateCommunityDelete(&community)
 		if err != nil {
@@ -141,7 +141,7 @@ var getExistingCommunities = func() (*v1beta1.CommunityList, error) {
 	existingCommunityList := &v1beta1.CommunityList{}
 	err := WebhookClient.List(context.Background(), existingCommunityList, &client.ListOptions{Namespace: MetalLBNamespace})
 	if err != nil {
-		return nil, errors.Wrapf(err, "Failed to get existing Community objects")
+		return nil, errors.Join(err, errors.New("failed to get existing Community objects"))
 	}
 	return existingCommunityList, nil
 }

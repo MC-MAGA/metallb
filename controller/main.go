@@ -25,13 +25,13 @@ import (
 	"go.universe.tf/metallb/internal/config"
 	"go.universe.tf/metallb/internal/k8s"
 	"go.universe.tf/metallb/internal/k8s/controllers"
-	"go.universe.tf/metallb/internal/k8s/epslices"
 	"go.universe.tf/metallb/internal/logging"
 	"go.universe.tf/metallb/internal/version"
 
 	"github.com/go-kit/log"
 	"github.com/go-kit/log/level"
 	v1 "k8s.io/api/core/v1"
+	discovery "k8s.io/api/discovery/v1"
 	cliflag "k8s.io/component-base/cli/flag"
 )
 
@@ -48,7 +48,7 @@ type controller struct {
 	ips    *allocator.Allocator
 }
 
-func (c *controller) SetBalancer(l log.Logger, name string, svcRo *v1.Service, _ epslices.EpsOrSlices) controllers.SyncState {
+func (c *controller) SetBalancer(l log.Logger, name string, svcRo *v1.Service, _ []discovery.EndpointSlice) controllers.SyncState {
 	level.Debug(l).Log("event", "startUpdate", "msg", "start of service update")
 	defer level.Debug(l).Log("event", "endUpdate", "msg", "end of service update")
 
@@ -86,6 +86,17 @@ func (c *controller) SetBalancer(l log.Logger, name string, svcRo *v1.Service, _
 	if reflect.DeepEqual(svcRo, svc) {
 		level.Debug(l).Log("event", "noChange", "msg", "service converged, no change")
 		return syncStateRes
+	}
+
+	// Check for any deprecated annotations.
+	// Normally, we would check the svc object within convergeBalancer.
+	// However, generating an event every time the svc is processed would be very noisy.
+	// Therefore, we check for deprecated annotations only, if there is something to do.
+	for key := range svcRo.Annotations {
+		if strings.HasPrefix(key, DeprecatedAnnotationPrefix) {
+			level.Warn(l).Log("event", "deprecatedAnnotation", "annotation", key, "msg", "The used annotation is deprecated. Support might get removed in future versions")
+			c.client.Errorf(svcRo, "deprecatedAnnotation", "Service uses deprecated annotation %s", key)
+		}
 	}
 
 	if len(prevIPs) != 0 && !c.isServiceAllocated(name) {
@@ -143,14 +154,13 @@ func main() {
 		mlSecret            = flag.String("ml-secret-name", os.Getenv("METALLB_ML_SECRET_NAME"), "name of the memberlist secret to create")
 		deployName          = flag.String("deployment", os.Getenv("METALLB_DEPLOYMENT"), "name of the MetalLB controller Deployment")
 		logLevel            = flag.String("log-level", "info", fmt.Sprintf("log level. must be one of: [%s]", logging.Levels.String()))
-		disableEpSlices     = flag.Bool("disable-epslices", false, "Disable the usage of EndpointSlices and default to Endpoints instead of relying on the autodiscovery mechanism")
 		enablePprof         = flag.Bool("enable-pprof", false, "Enable pprof profiling")
 		disableCertRotation = flag.Bool("disable-cert-rotation", false, "disable automatic generation and rotation of webhook TLS certificates/keys")
 		certDir             = flag.String("cert-dir", "/tmp/k8s-webhook-server/serving-certs", "The directory where certs are stored")
-		certServiceName     = flag.String("cert-service-name", "webhook-service", "The service name used to generate the TLS cert's hostname")
+		certServiceName     = flag.String("cert-service-name", "metallb-webhook-service", "The service name used to generate the TLS cert's hostname")
 		loadBalancerClass   = flag.String("lb-class", "", "load balancer class. When enabled, metallb will handle only services whose spec.loadBalancerClass matches the given lb class")
 		webhookMode         = flag.String("webhook-mode", "enabled", "webhook mode: can be enabled, disabled or only webhook if we want the controller to act as webhook endpoint only")
-		webhookSecretName   = flag.String("webhook-secret", "webhook-server-cert", "webhook secret: the name of webhook secret, default is webhook-server-cert")
+		webhookSecretName   = flag.String("webhook-secret", "metallb-webhook-cert", "webhook secret: the name of webhook secret, default is metallb-webhook-cert")
 		webhookHTTP2        = flag.Bool("webhook-http2", false, "enables http2 for the webhook endpoint")
 		tlsMinVersion       = flag.String("tls-min-version", "", "Minimum TLS version supported for the webhook server, Possible values: "+strings.Join(cliflag.TLSPossibleVersions(), ", "))
 		tlsCipherSuites     = flag.String("tls-cipher-suites", "TLS_AES_128_GCM_SHA256,TLS_AES_256_GCM_SHA384,TLS_CHACHA20_POLY1305_SHA256,TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,"+
@@ -205,11 +215,10 @@ func main() {
 	validation := config.ValidationFor(bgpType)
 
 	cfg := &k8s.Config{
-		ProcessName:     "metallb-controller",
-		MetricsPort:     *port,
-		EnablePprof:     *enablePprof,
-		Logger:          logger,
-		DisableEpSlices: *disableEpSlices,
+		ProcessName: "metallb-controller",
+		MetricsPort: *port,
+		EnablePprof: *enablePprof,
+		Logger:      logger,
 
 		Namespace: *namespace,
 		Listener: k8s.Listener{

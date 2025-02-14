@@ -23,10 +23,6 @@ func enableCertRotation(notifyFinished chan struct{}, cfg *Config, mgr manager.M
 			Type: rotator.Validating,
 		},
 		{
-			Name: addresspoolConvertingWebhookCRD,
-			Type: rotator.CRDConversion,
-		},
-		{
 			Name: bgppeerConvertingWebhookCRD,
 			Type: rotator.CRDConversion,
 		},
@@ -65,11 +61,6 @@ func enableWebhook(mgr manager.Manager, validate config.Validate, namespace stri
 	webhookv1beta2.WebhookClient = mgr.GetAPIReader()
 	webhookv1beta1.Validator = config.NewValidator(validate)
 	webhookv1beta2.Validator = config.NewValidator(validate)
-
-	if err := (&webhookv1beta1.AddressPoolValidator{}).SetupWebhookWithManager(mgr); err != nil {
-		level.Error(logger).Log("op", "startup", "error", err, "msg", "unable to create webhook", "webhook", "AddressPool")
-		return err
-	}
 
 	if err := (&webhookv1beta1.IPAddressPoolValidator{}).SetupWebhookWithManager(mgr); err != nil {
 		level.Error(logger).Log("op", "startup", "error", err, "msg", "unable to create webhook", "webhook", "IPAddressPool")

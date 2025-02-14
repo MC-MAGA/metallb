@@ -20,7 +20,10 @@ import (
 	"reflect"
 	"sort"
 	"strconv"
+	"sync"
 
+	"github.com/go-kit/log"
+	"github.com/go-kit/log/level"
 	"go.universe.tf/metallb/internal/bgp"
 	bgpfrr "go.universe.tf/metallb/internal/bgp/frr"
 	bgpfrrk8s "go.universe.tf/metallb/internal/bgp/frrk8s"
@@ -29,11 +32,11 @@ import (
 	"go.universe.tf/metallb/internal/k8s/epslices"
 	k8snodes "go.universe.tf/metallb/internal/k8s/nodes"
 	v1 "k8s.io/api/core/v1"
+	discovery "k8s.io/api/discovery/v1"
 	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/util/sets"
 
-	"github.com/go-kit/log"
-	"github.com/go-kit/log/level"
-	"github.com/pkg/errors"
+	"errors"
 )
 
 type bgpImplementation string
@@ -44,19 +47,33 @@ const (
 	bgpFrrK8s bgpImplementation = "frr-k8s"
 )
 
+type SecretHandling int
+
+const (
+	// Writing the secret reference in the frr-k8s configuration.
+	SecretPassThrough SecretHandling = iota
+	// Convert the password contained in the secret to the plain text password field.
+	SecretConvert
+)
+
 type peer struct {
 	cfg     *config.Peer
 	session bgp.Session
 }
 
 type bgpController struct {
-	logger         log.Logger
-	myNode         string
-	nodeLabels     labels.Set
-	peers          []*peer
-	svcAds         map[string][]*bgp.Advertisement
-	bgpType        bgpImplementation
-	sessionManager bgp.SessionManager
+	logger             log.Logger
+	myNode             string
+	nodeLabels         labels.Set
+	peers              []*peer
+	svcAds             map[string][]*bgp.Advertisement
+	activeAds          map[string]sets.Set[string] // svc -> the peers it is advertised to
+	activeAdsMutex     sync.RWMutex
+	adsChangedCallback func(string)
+	bgpType            bgpImplementation
+	secretHandling     SecretHandling
+	sessionManager     bgp.SessionManager
+	ignoreExcludeLB    bool
 }
 
 func (c *bgpController) SetConfig(l log.Logger, cfg *config.Config) error {
@@ -98,11 +115,11 @@ newPeers:
 
 	err := c.syncBFDProfiles(cfg.BFDProfiles)
 	if err != nil {
-		return errors.Wrap(err, "failed to sync bfd profiles")
+		return errors.Join(err, errors.New("failed to sync bfd profiles"))
 	}
 	err = c.sessionManager.SyncExtraInfo(cfg.BGPExtras)
 	if err != nil {
-		return errors.Wrap(err, "failed to sync extra info")
+		return errors.Join(err, errors.New("failed to sync extra info"))
 	}
 
 	return c.syncPeers(l)
@@ -114,43 +131,23 @@ func (c *bgpController) SetEventCallback(callback func(interface{})) {
 
 // hasHealthyEndpoint return true if this node has at least one healthy endpoint.
 // It only checks nodes matching the given filterNode function.
-func hasHealthyEndpoint(eps epslices.EpsOrSlices, filterNode func(*string) bool) bool {
+func hasHealthyEndpoint(eps []discovery.EndpointSlice, filterNode func(*string) bool) bool {
 	ready := map[string]bool{}
-	switch eps.Type {
-	case epslices.Eps:
-		for _, subset := range eps.EpVal.Subsets {
-			for _, ep := range subset.Addresses {
-				if filterNode(ep.NodeName) {
-					continue
-				}
-				if _, ok := ready[ep.IP]; !ok {
+	for _, slice := range eps {
+		for _, ep := range slice.Endpoints {
+			node := ep.NodeName
+			if filterNode(node) {
+				continue
+			}
+			for _, addr := range ep.Addresses {
+				if _, ok := ready[addr]; !ok && epslices.EndpointCanServe(ep.Conditions) {
 					// Only set true if nothing else has expressed an
 					// opinion. This means that false will take precedence
 					// if there's any unready ports for a given endpoint.
-					ready[ep.IP] = true
+					ready[addr] = true
 				}
-			}
-			for _, ep := range subset.NotReadyAddresses {
-				ready[ep.IP] = false
-			}
-		}
-	case epslices.Slices:
-		for _, slice := range eps.SlicesVal {
-			for _, ep := range slice.Endpoints {
-				node := ep.NodeName
-				if filterNode(node) {
-					continue
-				}
-				for _, addr := range ep.Addresses {
-					if _, ok := ready[addr]; !ok && epslices.IsConditionServing(ep.Conditions) {
-						// Only set true if nothing else has expressed an
-						// opinion. This means that false will take precedence
-						// if there's any unready ports for a given endpoint.
-						ready[addr] = true
-					}
-					if !epslices.IsConditionServing(ep.Conditions) {
-						ready[addr] = false
-					}
+				if !epslices.EndpointCanServe(ep.Conditions) {
+					ready[addr] = false
 				}
 			}
 		}
@@ -165,16 +162,22 @@ func hasHealthyEndpoint(eps epslices.EpsOrSlices, filterNode func(*string) bool)
 	return false
 }
 
-func (c *bgpController) ShouldAnnounce(l log.Logger, name string, _ []net.IP, pool *config.Pool, svc *v1.Service, eps epslices.EpsOrSlices, nodes map[string]*v1.Node) string {
+func (c *bgpController) ShouldAnnounce(l log.Logger, name string, _ []net.IP, pool *config.Pool, svc *v1.Service, epSlices []discovery.EndpointSlice, nodes map[string]*v1.Node) string {
 	if !poolMatchesNodeBGP(pool, c.myNode) {
 		level.Debug(l).Log("event", "skipping should announce bgp", "service", name, "reason", "pool not matching my node")
 		return "notOwner"
 	}
 
-	if k8snodes.IsNetworkUnavailable(nodes[c.myNode]) {
-		level.Debug(l).Log("event", "skipping should announce bgp", "service", name, "reason", "speaker's node has NodeNetworkUnavailable condition")
-		return "nodeNetworkUnavailable"
+	if err := k8snodes.IsNodeAvailable(nodes[c.myNode]); err != nil {
+		level.Warn(l).Log("event", "skipping should announce bgp", "service", name, "reason", err)
+		return err.Error()
 	}
+
+	if !c.ignoreExcludeLB && k8snodes.IsNodeExcludedFromBalancers(nodes[c.myNode]) {
+		level.Warn(l).Log("event", "skipping should announce bgp", "service", name, "reason", "speaker's node has labeled 'node.kubernetes.io/exclude-from-external-load-balancers'")
+		return "nodeLabeledExcludeBalancers"
+	}
+
 	// Should we advertise?
 	// Yes, if externalTrafficPolicy is
 	//  Cluster && any healthy endpoint exists
@@ -187,9 +190,9 @@ func (c *bgpController) ShouldAnnounce(l log.Logger, name string, _ []net.IP, po
 		return false
 	}
 
-	if svc.Spec.ExternalTrafficPolicy == v1.ServiceExternalTrafficPolicyTypeLocal && !hasHealthyEndpoint(eps, filterNode) {
+	if svc.Spec.ExternalTrafficPolicy == v1.ServiceExternalTrafficPolicyTypeLocal && !hasHealthyEndpoint(epSlices, filterNode) {
 		return "noLocalEndpoints"
-	} else if !hasHealthyEndpoint(eps, func(toFilter *string) bool { return false }) {
+	} else if !hasHealthyEndpoint(epSlices, func(toFilter *string) bool { return false }) {
 		return "noEndpoints"
 	}
 	return ""
@@ -232,24 +235,28 @@ func (c *bgpController) syncPeers(l log.Logger) error {
 			if p.cfg.RouterID != nil {
 				routerID = p.cfg.RouterID
 			}
-			s, err := c.sessionManager.NewSession(c.logger,
-				bgp.SessionParameters{
-					PeerAddress:   net.JoinHostPort(p.cfg.Addr.String(), strconv.Itoa(int(p.cfg.Port))),
-					SourceAddress: p.cfg.SrcAddr,
-					MyASN:         p.cfg.MyASN,
-					RouterID:      routerID,
-					PeerASN:       p.cfg.ASN,
-					HoldTime:      p.cfg.HoldTime,
-					KeepAliveTime: p.cfg.KeepaliveTime,
-					Password:      p.cfg.Password,
-					PasswordRef:   p.cfg.PasswordRef,
-					CurrentNode:   c.myNode,
-					BFDProfile:    p.cfg.BFDProfile,
-					EBGPMultiHop:  p.cfg.EBGPMultiHop,
-					SessionName:   p.cfg.Name,
-					VRFName:       p.cfg.VRF,
-				},
-			)
+
+			sessionParams := bgp.SessionParameters{
+				PeerAddress:     net.JoinHostPort(p.cfg.Addr.String(), strconv.Itoa(int(p.cfg.Port))),
+				SourceAddress:   p.cfg.SrcAddr,
+				MyASN:           p.cfg.MyASN,
+				RouterID:        routerID,
+				PeerASN:         p.cfg.ASN,
+				DynamicASN:      p.cfg.DynamicASN,
+				HoldTime:        p.cfg.HoldTime,
+				KeepAliveTime:   p.cfg.KeepaliveTime,
+				ConnectTime:     p.cfg.ConnectTime,
+				CurrentNode:     c.myNode,
+				BFDProfile:      p.cfg.BFDProfile,
+				GracefulRestart: p.cfg.EnableGracefulRestart,
+				EBGPMultiHop:    p.cfg.EBGPMultiHop,
+				SessionName:     p.cfg.Name,
+				VRFName:         p.cfg.VRF,
+				DisableMP:       p.cfg.DisableMP,
+			}
+			sessionParams.Password, sessionParams.PasswordRef = passwordForSession(p.cfg, c.bgpType, c.secretHandling)
+
+			s, err := c.sessionManager.NewSession(c.logger, sessionParams)
 
 			if err != nil {
 				level.Error(l).Log("op", "syncPeers", "error", err, "peer", p.cfg.Addr, "msg", "failed to create BGP session")
@@ -271,6 +278,30 @@ func (c *bgpController) syncPeers(l log.Logger) error {
 		return fmt.Errorf("%d BGP sessions failed to start", errs)
 	}
 	return nil
+}
+
+func passwordForSession(cfg *config.Peer, bgpType bgpImplementation, secret SecretHandling) (string, v1.SecretReference) {
+	if cfg.SecretPassword != "" && cfg.Password != "" {
+		panic(fmt.Sprintf("non empty password and secret password for peer %s", cfg.Name))
+	}
+	plainTextPassword := cfg.Password
+	if cfg.SecretPassword != "" {
+		plainTextPassword = cfg.SecretPassword
+	}
+	switch bgpType {
+	case bgpNative:
+		return plainTextPassword, v1.SecretReference{}
+	case bgpFrr:
+		return plainTextPassword, v1.SecretReference{}
+	case bgpFrrK8s:
+		// in case of passthrough, we don't propagate the converted password,
+		// so it's either the password as plain text or the secret
+		if secret == SecretPassThrough {
+			return cfg.Password, cfg.PasswordRef
+		}
+		return plainTextPassword, v1.SecretReference{}
+	}
+	return "", v1.SecretReference{}
 }
 
 func (c *bgpController) syncBFDProfiles(profiles map[string]*config.BFDProfile) error {
@@ -321,6 +352,15 @@ func (c *bgpController) SetBalancer(l log.Logger, name string, lbIPs []net.IP, p
 }
 
 func (c *bgpController) updateAds() error {
+	newAds, err := c.publishAds()
+	if err != nil {
+		return err
+	}
+	c.notifyAdsChanged(newAds)
+	return nil
+}
+
+func (c *bgpController) publishAds() (map[string][]*bgp.Advertisement, error) {
 	var allAds []*bgp.Advertisement
 	for _, ads := range c.svcAds {
 		// This list might contain duplicates, but that's fine,
@@ -331,15 +371,88 @@ func (c *bgpController) updateAds() error {
 		// and detecting conflicting advertisements.
 		allAds = append(allAds, ads...)
 	}
+	adsSet := map[string][]*bgp.Advertisement{}
 	for _, peer := range c.peers {
 		if peer.session == nil {
 			continue
 		}
-		if err := peer.session.Set(allAds...); err != nil {
-			return err
+		ads := adsForPeer(peer.cfg.Name, allAds)
+		if err := peer.session.Set(ads...); err != nil {
+			return nil, err
+		}
+		adsSet[peer.cfg.Name] = ads
+	}
+	return adsSet, nil
+}
+
+func (c *bgpController) notifyAdsChanged(newAds map[string][]*bgp.Advertisement) {
+	changedSvcs := []string{} // the services that their advs changed
+	defer func() {
+		for _, k := range changedSvcs {
+			c.adsChangedCallback(k)
+		}
+	}()
+
+	c.activeAdsMutex.Lock()
+	defer c.activeAdsMutex.Unlock()
+
+	pfxToSvc := map[string]sets.Set[string]{} // prefix -> the services that use it
+	for svcKey, ads := range c.svcAds {
+		for _, ad := range ads {
+			if _, ok := pfxToSvc[ad.Prefix.String()]; !ok {
+				pfxToSvc[ad.Prefix.String()] = sets.New(svcKey)
+				continue
+			}
+			pfxToSvc[ad.Prefix.String()].Insert(svcKey)
 		}
 	}
-	return nil
+
+	oldActiveAds := c.activeAds
+	newActiveAds := map[string]sets.Set[string]{}
+	for peer, ads := range newAds {
+		for _, ad := range ads {
+			adSvcs := pfxToSvc[ad.Prefix.String()]
+			for svc := range adSvcs {
+				if _, ok := newActiveAds[svc]; !ok {
+					newActiveAds[svc] = sets.New(peer)
+					continue
+				}
+				newActiveAds[svc].Insert(peer)
+			}
+		}
+	}
+
+	for svc, oldPeers := range oldActiveAds {
+		newPeers, ok := newActiveAds[svc]
+		if !ok {
+			changedSvcs = append(changedSvcs, svc)
+			continue
+		}
+		if !oldPeers.Equal(newPeers) {
+			changedSvcs = append(changedSvcs, svc)
+		}
+	}
+	for svc := range newActiveAds {
+		_, ok := oldActiveAds[svc]
+		if !ok {
+			changedSvcs = append(changedSvcs, svc)
+			continue
+		}
+	}
+	c.activeAds = newActiveAds
+}
+
+func adsForPeer(peerName string, ads []*bgp.Advertisement) []*bgp.Advertisement {
+	res := []*bgp.Advertisement{}
+	for _, a := range ads {
+		if a.MatchesPeer(peerName) {
+			res = append(res, a)
+		}
+	}
+	if len(res) == 0 {
+		return nil
+	}
+	return res
 }
 
 func (c *bgpController) DeleteBalancer(l log.Logger, name, reason string) error {
@@ -376,7 +489,7 @@ var newBGP = func(cfg controllerConfig) bgp.SessionManager {
 	case bgpFrr:
 		return bgpfrr.NewSessionManager(cfg.Logger, cfg.LogLevel)
 	case bgpFrrK8s:
-		return bgpfrrk8s.NewSessionManager(cfg.Logger, cfg.LogLevel, cfg.MyNode, cfg.Namespace)
+		return bgpfrrk8s.NewSessionManager(cfg.Logger, cfg.LogLevel, cfg.MyNode, cfg.FRRK8sNamespace)
 	default:
 		panic(fmt.Sprintf("unsupported BGP implementation type: %s", cfg.bgpType))
 	}
@@ -389,4 +502,10 @@ func poolMatchesNodeBGP(pool *config.Pool, node string) bool {
 		}
 	}
 	return false
+}
+
+func (c *bgpController) PeersForService(key string) sets.Set[string] {
+	c.activeAdsMutex.RLock()
+	defer c.activeAdsMutex.RUnlock()
+	return c.activeAds[key]
 }
